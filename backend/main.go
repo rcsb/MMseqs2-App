@@ -52,6 +52,30 @@ func ParseConfigName(args []string) (string, []string) {
 	return file, resArgs
 }
 
+// makeJobSystem builds the redis job system, and gives it the identity of the
+// results directory of this process when instances keep their own. Server and
+// worker of one instance read the same config and the same directory, so they
+// arrive at the same identity without being told what it is.
+func makeJobSystem(config ConfigRoot) *RedisJobSystem {
+	jobsystem := MakeRedisJobSystem(config.Redis)
+	if config.Instances.Enabled() == false {
+		return jobsystem
+	}
+
+	instance, err := LoadInstanceId(config.Paths.Results)
+	if err != nil {
+		panic(err)
+	}
+	address, err := AdvertisedAddress(config)
+	if err != nil {
+		panic(err)
+	}
+
+	jobsystem.Instance = instance
+	jobsystem.Address = address
+	return jobsystem
+}
+
 func main() {
 	t, args := ParseType(os.Args[1:])
 	configFile, args := ParseConfigName(args)
@@ -79,10 +103,10 @@ func main() {
 
 	switch t {
 	case WORKER:
-		worker(MakeRedisJobSystem(config.Redis), config)
+		worker(makeJobSystem(config), config)
 		break
 	case SERVER:
-		server(MakeRedisJobSystem(config.Redis), config)
+		server(makeJobSystem(config), config)
 		break
 	case LOCAL:
 		jobsystem, err := MakeLocalJobSystem(config.Paths.Results)

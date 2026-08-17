@@ -123,10 +123,17 @@ type JobSystem interface {
 
 type RedisJobSystem struct {
 	Client *redis.Client
+	// Identity of the results directory of this process, empty unless
+	// per-instance job directories are enabled. See instance.go.
+	Instance string
+	// Base URL other instances use to reach this one's server.
+	Address string
+
+	addresses addressCache
 }
 
 func MakeRedisJobSystem(config ConfigRedis) *RedisJobSystem {
-	return &RedisJobSystem{redis.NewClient(&redis.Options{
+	return &RedisJobSystem{Client: redis.NewClient(&redis.Options{
 		Network:  config.Network,
 		Addr:     config.Address,
 		Password: config.Password,
@@ -152,7 +159,12 @@ func (j *RedisJobSystem) Status(id Id) (Status, error) {
 		return StatusError, err
 	}
 
-	return Status(res), nil
+	status := Status(res)
+	if j.Tracking() {
+		status = j.checkOwner(id, status)
+	}
+
+	return status, nil
 }
 
 func (j *RedisJobSystem) GetTicket(id Id) (Ticket, error) {
@@ -166,6 +178,10 @@ func (j *RedisJobSystem) GetTicket(id Id) (Ticket, error) {
 }
 
 func (j *RedisJobSystem) NewJob(request JobRequest, jobsbase string, allowResubmit bool) (Ticket, error) {
+	if j.Tracking() {
+		return j.newTrackedJob(request, allowResubmit)
+	}
+
 	id := request.Id
 	res, err := j.Status(id)
 	if err != nil {
@@ -250,6 +266,21 @@ func (j *RedisJobSystem) NewJob(request JobRequest, jobsbase string, allowResubm
 func (j *RedisJobSystem) MultiStatus(ids []string) ([]Ticket, error) {
 	if len(ids) == 0 {
 		return make([]Ticket, 0), nil
+	}
+
+	// One MGET cannot tell whether the instances holding these results are
+	// still alive, and answering COMPLETE for results that are gone is worse
+	// than the extra round trips: this is the history page, not a poll loop.
+	if j.Tracking() {
+		result := make([]Ticket, 0, len(ids))
+		for _, value := range ids {
+			if !validId(value) {
+				continue
+			}
+			status, _ := j.Status(Id(value))
+			result = append(result, Ticket{Id(value), status})
+		}
+		return result, nil
 	}
 
 	var queries []string

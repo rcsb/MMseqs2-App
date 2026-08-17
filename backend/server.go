@@ -47,6 +47,18 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 	}()
 
+	// Without a tracker this is the shared volume setup: every server can read
+	// every job directory and nothing has to be forwarded anywhere.
+	tracker, tracked := Tracker(jobsystem)
+	route := func(handler http.HandlerFunc) http.HandlerFunc { return handler }
+	if tracked {
+		route = MakeOwnerRouter(tracker, config).Route
+		stop := make(chan struct{})
+		go tracker.Announce(stop)
+		go unannounceOnSignal(stop)
+	}
+	go janitor(jobsystem, config)
+
 	baseRouter := mux.NewRouter()
 	var r *mux.Router
 	if len(config.Server.PathPrefix) > 0 {
@@ -340,6 +352,8 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 	}).Methods("POST")
 
+	// The job input is in redis when instances keep their own job directories,
+	// so this endpoint is answerable everywhere and never has to be forwarded.
 	r.HandleFunc("/ticket/type/{ticket}", func(w http.ResponseWriter, req *http.Request) {
 		ticket, err := jobsystem.GetTicket(Id(mux.Vars(req)["ticket"]))
 		if err != nil {
@@ -347,7 +361,12 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 			return
 		}
 
-		request, err := getJobRequestFromFile(filepath.Join(config.Paths.Results, string(ticket.Id), "job.json"))
+		var request JobRequest
+		if tracked {
+			request, err = tracker.LoadJobRequest(ticket.Id)
+		} else {
+			request, err = getJobRequestFromFile(filepath.Join(config.Paths.Results, string(ticket.Id), "job.json"))
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -398,7 +417,12 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 	}).Methods("POST")
 
-	r.HandleFunc("/result/download/{ticket}", func(w http.ResponseWriter, req *http.Request) {
+	// These three read the files of a job, and with per-instance job
+	// directories those exist on exactly one instance. They are registered
+	// twice: wrapped in the owner router on the public API, which forwards
+	// them to the instance that ran the job, and unwrapped on the instance
+	// listener, which is where the forwarded requests arrive.
+	downloadHandler := func(w http.ResponseWriter, req *http.Request) {
 		vars := mux.Vars(req)
 		ticket, err := jobsystem.GetTicket(Id(vars["ticket"]))
 		if err != nil {
@@ -407,8 +431,14 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 
 		status, err := jobsystem.Status(ticket.Id)
-		if err != nil || status != StatusComplete {
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Not a panic on a nil error any more: a job whose results were reaped
+		// with the instance that held them lands here with status UNKNOWN.
+		if status != StatusComplete {
+			http.Error(w, "Job "+string(ticket.Id)+" is "+string(status), http.StatusBadRequest)
 			return
 		}
 
@@ -428,9 +458,9 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		w.Header().Set("Content-Disposition", "attachment; filename=\""+name+"\"")
 		w.Header().Set("Content-Type", "application/octet-stream")
 		io.Copy(w, bufio.NewReader(file))
-	}).Methods("GET")
+	}
 
-	r.HandleFunc("/result/{ticket}/{entry}", func(w http.ResponseWriter, req *http.Request) {
+	alignmentHandler := func(w http.ResponseWriter, req *http.Request) {
 		vars := mux.Vars(req)
 		id, err := strconv.ParseUint(vars["entry"], 10, 64)
 		if err != nil {
@@ -445,8 +475,14 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 
 		status, err := jobsystem.Status(ticket.Id)
-		if err != nil || status != StatusComplete {
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		// Not a panic on a nil error any more: a job whose results were reaped
+		// with the instance that held them lands here with status UNKNOWN.
+		if status != StatusComplete {
+			http.Error(w, "Job "+string(ticket.Id)+" is "+string(status), http.StatusBadRequest)
 			return
 		}
 
@@ -462,9 +498,9 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 			return
 		}
 
-	}).Methods("GET")
+	}
 
-	r.HandleFunc("/result/queries/{ticket}/{limit}/{page}", func(w http.ResponseWriter, req *http.Request) {
+	queriesHandler := func(w http.ResponseWriter, req *http.Request) {
 		vars := mux.Vars(req)
 		ticket, err := jobsystem.GetTicket(Id(vars["ticket"]))
 		if err != nil {
@@ -490,7 +526,30 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
-	}).Methods("GET")
+	}
+
+	// Registration order matters: /result/download/{ticket} would otherwise be
+	// taken by /result/{ticket}/{entry}, with "download" read as a ticket.
+	r.HandleFunc("/result/download/{ticket}", route(downloadHandler)).Methods("GET")
+	r.HandleFunc("/result/{ticket}/{entry}", route(alignmentHandler)).Methods("GET")
+	r.HandleFunc("/result/queries/{ticket}/{limit}/{page}", route(queriesHandler)).Methods("GET")
+
+	if tracked {
+		peerRouter := mux.NewRouter()
+		var p *mux.Router
+		if len(config.Server.PathPrefix) > 0 {
+			p = peerRouter.PathPrefix(config.Server.PathPrefix).Subrouter()
+		} else {
+			p = peerRouter
+		}
+		// Only the endpoints that have to be answered by this instance in
+		// particular, and only reading. Job submission stays on the public
+		// listener, behind whatever proxy enforces the upload limits.
+		p.HandleFunc("/result/download/{ticket}", downloadHandler).Methods("GET")
+		p.HandleFunc("/result/{ticket}/{entry}", alignmentHandler).Methods("GET")
+		p.HandleFunc("/result/queries/{ticket}/{limit}/{page}", queriesHandler).Methods("GET")
+		go ServePeers(config, peerRouter)
+	}
 
 	h := http.Handler(r)
 	if config.Server.Auth != nil {

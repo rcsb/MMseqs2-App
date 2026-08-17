@@ -40,6 +40,25 @@ var defaultFileContent = []byte(`{
         // path to mmseqs binary
         "mmseqs"       : "~mmseqs"
     },
+    /* per-instance job directories (optional)
+       Set an address and the "results" path above no longer has to be shared
+       between servers and workers: redis keeps track of which instance holds
+       which job, and servers forward requests for jobs they do not have to
+       the instance that ran them. The address has to be reachable by the
+       other instances.
+    "instances" : {
+        "address"   : ":8082",
+        // defaults to the local address that reaches redis
+        "advertise" : "",
+        // shared secret required on forwarded requests
+        "token"     : ""
+    },
+    */
+    // how long finished jobs are kept on this instance, in minutes
+    "cleanup" : {
+        "maxage"   : 0,
+        "interval" : 10
+    },
     // connection details for redis database, not used in -local mode
     "redis" : {
         "network"  : "tcp",
@@ -158,13 +177,49 @@ type ConfigServer struct {
 	Auth        *ConfigAuth `json:"auth" valid:"optional"`
 }
 
+// ConfigInstances turns the results directory from something every server and
+// worker has to share into something each of them can keep to itself.
+//
+// Setting an address enables it: redis then tracks which instance holds which
+// job, servers forward requests for jobs they do not have, and each instance
+// cleans up after itself. Leaving it empty keeps the shared volume behaviour.
+type ConfigInstances struct {
+	// Where to listen for requests forwarded by other instances, ":8082" for
+	// example. Must be reachable by them, so not a loopback address.
+	Address string `json:"address" valid:"optional"`
+	// What to tell other instances to connect to. Defaults to the local
+	// address that reaches redis, which is the right one in almost every
+	// setup; set it when that guess is wrong.
+	Advertise string `json:"advertise" valid:"optional"`
+	// Shared secret required on forwarded requests. Optional, but the
+	// listener is reachable by anything that can route to the pod.
+	Token string `json:"token" valid:"optional"`
+}
+
+func (c ConfigInstances) Enabled() bool {
+	return len(c.Address) > 0
+}
+
+// ConfigCleanup bounds what an instance keeps on its own disk. Nothing outside
+// the instance can prune a per-instance volume, so this is not optional
+// housekeeping: without it a long lived instance fills its volume up.
+type ConfigCleanup struct {
+	// Minutes a finished job is kept before its directory is deleted and its
+	// redis keys are dropped. Zero disables cleanup.
+	MaxAge int `json:"maxage" valid:"optional"`
+	// Minutes between sweeps.
+	Interval int `json:"interval" valid:"optional"`
+}
+
 type ConfigRoot struct {
-	Server  ConfigServer `json:"server" valid:"required"`
-	Paths   ConfigPaths  `json:"paths" valid:"required"`
-	Redis   ConfigRedis  `json:"redis" valid:"optional"`
-	Local   ConfigLocal  `json:"local" valid:"optional"`
-	Mail    ConfigMail   `json:"mail" valid:"optional"`
-	Verbose bool         `json:"verbose"`
+	Server    ConfigServer    `json:"server" valid:"required"`
+	Paths     ConfigPaths     `json:"paths" valid:"required"`
+	Redis     ConfigRedis     `json:"redis" valid:"optional"`
+	Local     ConfigLocal     `json:"local" valid:"optional"`
+	Mail      ConfigMail      `json:"mail" valid:"optional"`
+	Instances ConfigInstances `json:"instances" valid:"optional"`
+	Cleanup   ConfigCleanup   `json:"cleanup" valid:"optional"`
+	Verbose   bool            `json:"verbose"`
 }
 
 func ReadConfigFromFile(name string) (ConfigRoot, error) {

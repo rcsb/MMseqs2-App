@@ -310,6 +310,49 @@ rm -rf "${BASE}/tmp"
 	}
 }
 
+// stageJob rebuilds the job directory on this instance's own disk from the
+// input kept in redis. Without a shared volume the worker never sees what the
+// server wrote when it accepted the job, so the request has to carry
+// everything the job needs.
+func stageJob(tracker JobTracker, id Id, config ConfigRoot) (JobRequest, error) {
+	request, err := tracker.LoadJobRequest(id)
+	if err != nil {
+		return request, err
+	}
+
+	workdir := filepath.Join(filepath.Clean(config.Paths.Results), string(id))
+	if err := os.RemoveAll(workdir); err != nil {
+		return request, err
+	}
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		return request, err
+	}
+	if err := request.WriteSupportFiles(workdir); err != nil {
+		return request, err
+	}
+
+	file, err := os.Create(filepath.Join(workdir, "job.json"))
+	if err != nil {
+		return request, err
+	}
+	if err := json.NewEncoder(file).Encode(request); err != nil {
+		file.Close()
+		return request, err
+	}
+	if err := file.Close(); err != nil {
+		return request, err
+	}
+
+	// Claimed before the job is marked RUNNING: from that point on a client
+	// can ask for it, and every server has to be able to work out that the
+	// answer is here.
+	if err := tracker.ClaimJob(id); err != nil {
+		return request, err
+	}
+
+	return request, nil
+}
+
 func worker(jobsystem JobSystem, config ConfigRoot) {
 	log.Println("MMseqs2 worker")
 	mailer := MailTransport(NullTransport{})
@@ -317,7 +360,15 @@ func worker(jobsystem JobSystem, config ConfigRoot) {
 		log.Println("Using " + config.Mail.Mailer.Type + " mail transport")
 		mailer = config.Mail.Mailer.GetTransport()
 	}
+	tracker, tracked := Tracker(jobsystem)
 	for {
+		// Results that land on this instance are only reachable through its
+		// server. If that is not registered, taking a job would put its
+		// results somewhere nobody can read them, so wait for it instead.
+		if tracked {
+			waitForInstance(tracker)
+		}
+
 		ticket, err := jobsystem.Dequeue()
 		if err != nil {
 			if ticket != nil {
@@ -332,23 +383,32 @@ func worker(jobsystem JobSystem, config ConfigRoot) {
 			continue
 		}
 
-		jobFile := filepath.Join(config.Paths.Results, string(ticket.Id), "job.json")
-
-		f, err := os.Open(jobFile)
-		if err != nil {
-			jobsystem.SetStatus(ticket.Id, StatusError)
-			log.Print(err)
-			continue
-		}
-
 		var job JobRequest
-		dec := json.NewDecoder(bufio.NewReader(f))
-		err = dec.Decode(&job)
-		f.Close()
-		if err != nil {
-			jobsystem.SetStatus(ticket.Id, StatusError)
-			log.Print(err)
-			continue
+		if tracked {
+			job, err = stageJob(tracker, ticket.Id, config)
+			if err != nil {
+				jobsystem.SetStatus(ticket.Id, StatusError)
+				log.Print(err)
+				continue
+			}
+		} else {
+			jobFile := filepath.Join(config.Paths.Results, string(ticket.Id), "job.json")
+
+			f, err := os.Open(jobFile)
+			if err != nil {
+				jobsystem.SetStatus(ticket.Id, StatusError)
+				log.Print(err)
+				continue
+			}
+
+			dec := json.NewDecoder(bufio.NewReader(f))
+			err = dec.Decode(&job)
+			f.Close()
+			if err != nil {
+				jobsystem.SetStatus(ticket.Id, StatusError)
+				log.Print(err)
+				continue
+			}
 		}
 
 		jobsystem.SetStatus(ticket.Id, StatusRunning)
