@@ -1,15 +1,23 @@
 ARG NAMESPACE=soedinglab/
 ARG VERSION=version-13
-FROM golang:latest as mmseqs-web-builder
+# Pinned to a minor line rather than latest: this code targets go 1.12 and its
+# dependencies are from 2019, so a future release dropping something would break a
+# build that had not changed. 1.26 keeps patch updates coming; verified building
+# with 1.26.6.
+FROM golang:1.26 AS mmseqs-web-builder
 
 WORKDIR /opt/mmseqs-web
-ADD backend .
+COPY backend .
 RUN go build -o mmseqs-backend
 
 FROM ${NAMESPACE}mmseqs2:${VERSION}
 LABEL maintainer="Milot Mirdita <milot@mirdita.de>"
 
-RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+# DL3008 (pin the package version) is ignored on purpose: ca-certificates is the one
+# package you always want current, and pinning it breaks the build the day Debian
+# ships a new one and drops the old from the archive.
+# hadolint ignore=DL3008
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
 
 COPY --from=mmseqs-web-builder /opt/mmseqs-web/mmseqs-backend /usr/local/bin/mmseqs-web
 

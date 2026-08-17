@@ -1,3 +1,9 @@
+# This file is shared by Dockerfile.backend and Dockerfile.frontend, which build from
+# the repository root. Do not exclude frontend/, package.json, .babelrc or
+# webpack.frontend.config.js to trim the backend build: the frontend image needs them.
+# .git is ~30MB of the ~33MB context and is read by neither.
+.git/
+.idea/
 .vscode/
 dist/
 build/
