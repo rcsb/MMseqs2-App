@@ -73,6 +73,7 @@ func makeJobSystem(config ConfigRoot) *RedisJobSystem {
 
 	jobsystem.Instance = instance
 	jobsystem.Address = address
+	jobsystem.Retention = config.Retention()
 	return jobsystem
 }
 
@@ -98,6 +99,10 @@ func main() {
 	}
 
 	if err := config.CheckPaths(); err != nil {
+		panic(err)
+	}
+
+	if err := config.CheckCleanup(); err != nil {
 		panic(err)
 	}
 

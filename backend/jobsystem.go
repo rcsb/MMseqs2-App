@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis"
 )
@@ -128,6 +129,9 @@ type RedisJobSystem struct {
 	Instance string
 	// Base URL other instances use to reach this one's server.
 	Address string
+	// How long the keys of a finished job outlive it. Zero keeps them
+	// forever, which is what the shared volume setup did.
+	Retention time.Duration
 
 	addresses addressCache
 }
@@ -142,9 +146,26 @@ func MakeRedisJobSystem(config ConfigRedis) *RedisJobSystem {
 }
 
 func (j *RedisJobSystem) SetStatus(id Id, status Status) error {
-	_, err := j.Client.Set("mmseqs:status:"+string(id), string(status), 0).Result()
+	// A finished job is kept for as long as its files are, and no longer. The
+	// janitor of the instance holding them normally deletes both together;
+	// this is what covers the case where that instance never gets to, because
+	// it died. Nothing expires while a job is queued or running, since a job
+	// nobody has finished has no lifetime yet.
+	expiry := time.Duration(0)
+	if j.Retention > 0 && (status == StatusComplete || status == StatusError) {
+		expiry = j.Retention
+	}
+
+	_, err := j.Client.Set("mmseqs:status:"+string(id), string(status), expiry).Result()
 	if err != nil {
 		return err
+	}
+
+	if expiry > 0 {
+		// The input and the ownership record are only useful for as long as
+		// the status is.
+		j.Client.Expire(keyJob+string(id), expiry)
+		j.Client.Expire(keyOwner+string(id), expiry)
 	}
 
 	return nil

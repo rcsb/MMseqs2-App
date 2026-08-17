@@ -66,12 +66,31 @@ produced then would sit on a volume nobody can reach.
 ## Cleaning up
 
 Nothing outside an instance can see its results directory, so no external cron
-job can prune it. Set `cleanup.maxage` and each instance deletes its own
-finished jobs, dropping the redis keys of the ones it still owns as it goes.
-This is not optional housekeeping under this layout: without it a long lived
-instance fills its volume.
+job can prune it. Each instance deletes its own finished jobs instead, dropping
+the redis keys of the ones it still owns as it goes. This is not optional
+housekeeping under this layout, so a configuration that enables instances
+without bounding what they keep is refused at startup.
 
-The queue itself is still shared, and pruning stale queue entries is still
+There are two bounds and they answer different questions:
+
+- `cleanup.maxage` is the retention policy: how long after a search its results
+  can still be fetched. Results are not something a job is finished with when
+  it completes, they are what the interface reads while somebody looks at them,
+  one query and one page of hits at a time. So this cannot go to zero, and
+  "do not cache at all" is not a setting: it is the length of a session.
+- `cleanup.maxsize` is what actually bounds the volume, because an age limit
+  says nothing about how much a busy hour writes. Over the limit, the oldest
+  finished jobs are deleted first, however young they are.
+
+Set both. The age limit is the policy; the size limit is what stops a traffic
+spike from filling a disk that, unlike a shared volume, is small and fixed.
+
+The redis keys of a finished job carry a TTL a little longer than the age
+limit. Normally the janitor deletes keys and files together and the TTL never
+matters; it is there for the keys of an instance that died before its janitor
+got to them, which nothing else would ever collect.
+
+The queue itself is still shared, so pruning abandoned queue entries is still
 something to do from outside.
 
 ## Configuration
@@ -87,8 +106,12 @@ something to do from outside.
     "token"     : ""
 },
 "cleanup" : {
-    // minutes a finished job is kept, 0 disables cleanup
+    // minutes a finished job stays fetchable, 0 for no age limit
     "maxage"   : 60,
+    // megabytes the results directory may use, oldest deleted first,
+    // 0 for no limit
+    "maxsize"  : 4096,
+    // minutes between sweeps
     "interval" : 10
 }
 ```

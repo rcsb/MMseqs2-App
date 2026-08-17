@@ -170,7 +170,7 @@ func TestJanitorSweep(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := sweep(jobsystem, dir, time.Hour); err != nil {
+	if err := sweep(jobsystem, dir, time.Hour, 0); err != nil {
 		t.Fatal(err)
 	}
 
@@ -202,6 +202,59 @@ func TestJanitorSweep(t *testing.T) {
 	}
 }
 
+// An age limit is a retention policy, not a bound on the volume: a busy hour
+// writes as much as it writes. The size limit is what keeps the disk from
+// filling, so it has to evict jobs that are nowhere near old enough.
+func TestJanitorSweepEnforcesSizeLimit(t *testing.T) {
+	dir, err := ioutil.TempDir("", "results")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	oldest := testId("oldest")
+	middle := testId("middle")
+	newest := testId("newest")
+
+	jobsystem := &fakeJobSystem{
+		instance: "self",
+		status: map[Id]Status{
+			oldest: StatusComplete,
+			middle: StatusComplete,
+			newest: StatusComplete,
+		},
+		owners: map[Id]string{
+			oldest: "self",
+			middle: "self",
+			newest: "self",
+		},
+	}
+
+	now := time.Now()
+	for i, id := range []Id{oldest, middle, newest} {
+		makeJobDir(t, dir, id, now.Add(-time.Duration(10-i)*time.Minute))
+		padJobDir(t, dir, id, 4096)
+	}
+
+	// Everything is minutes old, so only the size limit can bite. Room for
+	// two of the three directories: the oldest has to go, the others stay.
+	if err := sweep(jobsystem, dir, time.Hour, 9000); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := os.Stat(filepath.Join(dir, string(oldest))); os.IsNotExist(err) == false {
+		t.Fatal("the oldest job was kept while the directory was over its size limit")
+	}
+	for _, id := range []Id{middle, newest} {
+		if _, err := os.Stat(filepath.Join(dir, string(id))); err != nil {
+			t.Fatalf("%s was deleted after the limit was already met: %v", id, err)
+		}
+	}
+	if jobsystem.forgotten[oldest] == false {
+		t.Fatal("keys of an evicted job were kept")
+	}
+}
+
 func makeJobDir(t *testing.T, base string, id Id, modtime time.Time) {
 	t.Helper()
 	dir := filepath.Join(base, string(id))
@@ -212,6 +265,22 @@ func makeJobDir(t *testing.T, base string, id Id, modtime time.Time) {
 		t.Fatal(err)
 	}
 	if err := os.Chtimes(dir, modtime, modtime); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func padJobDir(t *testing.T, base string, id Id, size int) {
+	t.Helper()
+	dir := filepath.Join(base, string(id))
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ioutil.WriteFile(filepath.Join(dir, "alis_pdb"), make([]byte, size), 0644); err != nil {
+		t.Fatal(err)
+	}
+	// Writing into the directory moved its mtime, and the sweep orders by it.
+	if err := os.Chtimes(dir, info.ModTime(), info.ModTime()); err != nil {
 		t.Fatal(err)
 	}
 }

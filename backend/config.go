@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var defaultFileContent = []byte(`{
@@ -54,9 +55,15 @@ var defaultFileContent = []byte(`{
         "token"     : ""
     },
     */
-    // how long finished jobs are kept on this instance, in minutes
+    // what this instance keeps of the jobs it has finished. Required when
+    // "instances" is enabled, since nothing outside an instance can prune it.
     "cleanup" : {
-        "maxage"   : 0,
+        // minutes a finished job stays fetchable, 0 for no age limit
+        "maxage"   : 60,
+        // megabytes the results directory may use, oldest jobs deleted first,
+        // 0 for no limit
+        "maxsize"  : 0,
+        // minutes between sweeps
         "interval" : 10
     },
     // connection details for redis database, not used in -local mode
@@ -205,10 +212,55 @@ func (c ConfigInstances) Enabled() bool {
 // housekeeping: without it a long lived instance fills its volume up.
 type ConfigCleanup struct {
 	// Minutes a finished job is kept before its directory is deleted and its
-	// redis keys are dropped. Zero disables cleanup.
+	// redis keys are dropped. This is the retention policy: how long after a
+	// search its results can still be fetched. Zero means no age limit.
 	MaxAge int `json:"maxage" valid:"optional"`
+	// Megabytes the results directory may use, oldest jobs deleted first when
+	// it is over. This is what actually bounds the volume, since an age limit
+	// says nothing about how much a busy hour writes. Zero means no limit.
+	MaxSize int `json:"maxsize" valid:"optional"`
 	// Minutes between sweeps.
 	Interval int `json:"interval" valid:"optional"`
+}
+
+const DefaultCleanupInterval = 10 * time.Minute
+
+// Retention is how long the redis keys of a finished job are kept. The janitor
+// is what normally deletes a job, keys and files together, so this only has to
+// cover the case where it never gets to: an instance that died. It trails the
+// janitor by a couple of sweeps so that it is never redis that expires a job
+// whose files are still there to be read.
+func (c ConfigRoot) Retention() time.Duration {
+	if c.Instances.Enabled() == false {
+		return 0
+	}
+
+	interval := time.Duration(c.Cleanup.Interval) * time.Minute
+	if interval <= 0 {
+		interval = DefaultCleanupInterval
+	}
+
+	if c.Cleanup.MaxAge <= 0 {
+		// Only a size limit is set, so a job has no age at which it is due to
+		// be deleted. The keys still need an end, or the ones belonging to an
+		// instance that died stay in redis for good.
+		return 24 * time.Hour
+	}
+	return time.Duration(c.Cleanup.MaxAge)*time.Minute + 2*interval
+}
+
+// CheckCleanup refuses a configuration that would grow without bound. With a
+// per-instance results directory there is no cron job that can come along
+// later and clean up, so an instance that does not prune itself fills its
+// volume and stops serving.
+func (c *ConfigRoot) CheckCleanup() error {
+	if c.Instances.Enabled() == false {
+		return nil
+	}
+	if c.Cleanup.MaxAge <= 0 && c.Cleanup.MaxSize <= 0 {
+		return errors.New("instances.address is set, so nothing outside this instance can prune its results: set cleanup.maxage (minutes), cleanup.maxsize (megabytes), or both")
+	}
+	return nil
 }
 
 type ConfigRoot struct {
