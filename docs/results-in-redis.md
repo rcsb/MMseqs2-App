@@ -66,17 +66,39 @@ silently thrown away.
 
 ## Sizing
 
-Memory is the constraint, since redis holds all of this in RAM:
+Memory is the constraint, since redis holds all of this in RAM. Measured over
+796 real queries:
 
-```
-rate x ttl x response size
-```
+| | raw JSON |
+|---|---|
+| median | 191,874 B (~187 KB) |
+| max | 1,740,081 B (~1.7 MB) |
 
-At 1000 queries/min with a 5 minute ttl and 200KB responses that is about 1GB
-before compression, and responses are mostly aligned sequence strings, which
-gzip well. Measure the real response size — `curl -s .../api/result/<id>/0 |
-wc -c` over representative queries — before setting `results.ttl` and the redis
-memory limit, because a query with many hits is far larger than the median.
+The distribution is right skewed — a query against a well represented protein
+hits the `--max-seqs` cap and carries two aligned sequence strings per hit — so
+size the memory from the **mean**, not the median, and leave room for the tail.
+
+Responses are stored gzipped. Alignment JSON compresses roughly five to eight
+fold, so at 1000 queries/min, taking the median as a stand-in for the mean:
+
+| ttl | compressed, at 1000 q/min | at today's 180/min peak |
+|---|---|---|
+| 5 min | ~160 MB | ~30 MB |
+| 15 min | ~470 MB | ~85 MB |
+| 60 min | ~1.9 GB | ~340 MB |
+
+So the current 1Gi redis limit is ample at today's traffic with a 15 minute
+ttl, and at 1000 q/min wants either a 5 minute ttl or a larger redis. Add
+headroom over these figures: they use the median, and the mean is higher.
+
+Set `maxmemory` below the container's memory limit, with
+`maxmemory-policy volatile-lru`. A redis that reaches its container limit is
+OOM killed and takes the whole path down; one that reaches `maxmemory` evicts
+instead. **`volatile-lru` and not `allkeys-lru`**: only finished jobs carry a
+TTL, so eviction can only ever drop results that are already expiring, never
+the pending queue or the status of a job still queued or running. An evicted
+result behaves exactly like an expired one — the ticket is unknown, and
+resubmitting the query runs it again.
 
 ## Configuration
 
