@@ -8,16 +8,26 @@ FROM golang:1.26 AS mmseqs-web-builder
 
 WORKDIR /opt/mmseqs-web
 COPY backend .
-RUN go build -o mmseqs-backend
+# CGO_ENABLED=0 is required, not just tidiness. Go links against the builder's glibc
+# whenever cgo is on (net and os/user pull it in), and this builder is a current Debian
+# while the runtime image below is Debian 10 -- so a cgo build produces a binary that
+# builds fine, pushes fine, and then dies at startup with "GLIBC_2.34 not found".
+# The backend has no cgo dependencies, so a static build is a free fix.
+RUN CGO_ENABLED=0 go build -o mmseqs-backend
 
 FROM ${NAMESPACE}mmseqs2:${VERSION}
 LABEL maintainer="Milot Mirdita <milot@mirdita.de>"
 
-# DL3008 (pin the package version) is ignored on purpose: ca-certificates is the one
-# package you always want current, and pinning it breaks the build the day Debian
-# ships a new one and drops the old from the archive.
-# hadolint ignore=DL3008
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# The base image is Debian 10 (buster), long EOL, and its sources.list pins the
+# floating "stable" suite -- which now resolves to Debian 13, signed with keys buster's
+# keyring does not carry (NO_PUBKEY), while security.debian.org/... stable/updates is
+# the pre-bullseye layout and 404s. So apt cannot run here at all.
+# ca-certificates is already installed in the base image, just stale (2021). Lift the
+# bundle and the hashed CApath from the builder stage instead: it is a current Debian,
+# so these certs are newer than buster's archive could ever supply, and the build stops
+# depending on the network or on Debian's suite aliases.
+COPY --from=mmseqs-web-builder /usr/share/ca-certificates /usr/share/ca-certificates
+COPY --from=mmseqs-web-builder /etc/ssl/certs /etc/ssl/certs
 
 COPY --from=mmseqs-web-builder /opt/mmseqs-web/mmseqs-backend /usr/local/bin/mmseqs-web
 
