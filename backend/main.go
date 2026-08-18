@@ -52,6 +52,15 @@ func ParseConfigName(args []string) (string, []string) {
 	return file, resArgs
 }
 
+// makeJobSystem builds the redis job system that holds job inputs, statuses
+// and results, so that servers and workers share nothing but redis.
+func makeJobSystem(config ConfigRoot) *RedisJobSystem {
+	jobsystem := MakeRedisJobSystem(config.Redis)
+	jobsystem.Retention = config.Results.Retention()
+	jobsystem.Lease = config.Results.LeaseDuration()
+	return jobsystem
+}
+
 func main() {
 	t, args := ParseType(os.Args[1:])
 	configFile, args := ParseConfigName(args)
@@ -79,10 +88,10 @@ func main() {
 
 	switch t {
 	case WORKER:
-		worker(MakeRedisJobSystem(config.Redis), config)
+		worker(makeJobSystem(config), config)
 		break
 	case SERVER:
-		server(MakeRedisJobSystem(config.Redis), config)
+		server(makeJobSystem(config), config)
 		break
 	case LOCAL:
 		jobsystem, err := MakeLocalJobSystem(config.Paths.Results)

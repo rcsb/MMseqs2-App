@@ -48,6 +48,10 @@ func (d *Reader) Make(data string, index string) {
 }
 
 func (d *Reader) Delete() {
+	// Make returns silently when the files are missing, leaving this nil.
+	if d.file == nil {
+		return
+	}
 	d.file.Close()
 }
 

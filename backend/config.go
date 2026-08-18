@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"time"
 )
 
 var defaultFileContent = []byte(`{
@@ -39,6 +40,13 @@ var defaultFileContent = []byte(`{
         "results"      : "~jobs",
         // path to mmseqs binary
         "mmseqs"       : "~mmseqs"
+    },
+    // how long finished jobs are kept in redis, which is where results live
+    "results" : {
+        // minutes a finished job stays fetchable
+        "ttl"   : 15,
+        // seconds a running job survives without a heartbeat from its worker
+        "lease" : 60
     },
     // connection details for redis database, not used in -local mode
     "redis" : {
@@ -158,13 +166,47 @@ type ConfigServer struct {
 	Auth        *ConfigAuth `json:"auth" valid:"optional"`
 }
 
+// ConfigResults bounds how long finished work is kept in redis. It is the
+// whole retention policy now that results live there rather than on a disk:
+// nothing else expires them, and redis holds them in memory.
+type ConfigResults struct {
+	// Minutes a finished job's status, input and results are kept. Long
+	// enough for a client to poll and then fetch, not longer: this is
+	// memory, and a repeat of the same query simply runs again.
+	TTL int `json:"ttl" valid:"optional"`
+	// Seconds a RUNNING job survives without its worker refreshing it. A
+	// worker that dies mid-job stops being RUNNING after this, and the
+	// ticket becomes resubmittable instead of stuck for ever.
+	Lease int `json:"lease" valid:"optional"`
+}
+
+const (
+	DefaultResultTTL   = 15 * time.Minute
+	DefaultResultLease = 60 * time.Second
+)
+
+func (c ConfigResults) Retention() time.Duration {
+	if c.TTL <= 0 {
+		return DefaultResultTTL
+	}
+	return time.Duration(c.TTL) * time.Minute
+}
+
+func (c ConfigResults) LeaseDuration() time.Duration {
+	if c.Lease <= 0 {
+		return DefaultResultLease
+	}
+	return time.Duration(c.Lease) * time.Second
+}
+
 type ConfigRoot struct {
-	Server  ConfigServer `json:"server" valid:"required"`
-	Paths   ConfigPaths  `json:"paths" valid:"required"`
-	Redis   ConfigRedis  `json:"redis" valid:"optional"`
-	Local   ConfigLocal  `json:"local" valid:"optional"`
-	Mail    ConfigMail   `json:"mail" valid:"optional"`
-	Verbose bool         `json:"verbose"`
+	Server  ConfigServer  `json:"server" valid:"required"`
+	Paths   ConfigPaths   `json:"paths" valid:"required"`
+	Redis   ConfigRedis   `json:"redis" valid:"optional"`
+	Local   ConfigLocal   `json:"local" valid:"optional"`
+	Mail    ConfigMail    `json:"mail" valid:"optional"`
+	Results ConfigResults `json:"results" valid:"optional"`
+	Verbose bool          `json:"verbose"`
 }
 
 func ReadConfigFromFile(name string) (ConfigRoot, error) {

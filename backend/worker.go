@@ -310,6 +310,60 @@ rm -rf "${BASE}/tmp"
 	}
 }
 
+// stageJob rebuilds the job directory this worker needs from the request in
+// redis. Without a shared disk the worker never sees what the server wrote
+// when it accepted the job, so the request has to carry everything.
+func stageJob(store ResultStore, id Id, config ConfigRoot) (JobRequest, error) {
+	request, err := store.LoadJobRequest(id)
+	if err != nil {
+		return request, err
+	}
+
+	workdir := filepath.Join(filepath.Clean(config.Paths.Results), string(id))
+	if err := os.RemoveAll(workdir); err != nil {
+		return request, err
+	}
+	if err := os.MkdirAll(workdir, 0755); err != nil {
+		return request, err
+	}
+	if err := request.WriteSupportFiles(workdir); err != nil {
+		return request, err
+	}
+
+	file, err := os.Create(filepath.Join(workdir, "job.json"))
+	if err != nil {
+		return request, err
+	}
+	if err := json.NewEncoder(file).Encode(request); err != nil {
+		file.Close()
+		return request, err
+	}
+	if err := file.Close(); err != nil {
+		return request, err
+	}
+
+	return request, nil
+}
+
+// storeResults renders what the API serves out of a finished job directory,
+// then throws the directory away. The job directory is scratch space for
+// mmseqs from here on: nothing outside this pod ever reads it.
+func storeResults(store ResultStore, id Id, request JobRequest, config ConfigRoot) error {
+	count, err := store.StoreResults(id, config.Paths.Results)
+	if err != nil {
+		return err
+	}
+
+	// An msa job has no alignments to render; its results are files that only
+	// /result/download can serve. Keep the directory rather than dropping them
+	// silently. An index job has nothing in its directory worth keeping.
+	if count == 0 && request.Type != JobIndex {
+		return nil
+	}
+
+	return os.RemoveAll(filepath.Join(filepath.Clean(config.Paths.Results), string(id)))
+}
+
 func worker(jobsystem JobSystem, config ConfigRoot) {
 	log.Println("MMseqs2 worker")
 	mailer := MailTransport(NullTransport{})
@@ -317,6 +371,7 @@ func worker(jobsystem JobSystem, config ConfigRoot) {
 		log.Println("Using " + config.Mail.Mailer.Type + " mail transport")
 		mailer = config.Mail.Mailer.GetTransport()
 	}
+	store, stored := Results(jobsystem)
 	for {
 		ticket, err := jobsystem.Dequeue()
 		if err != nil {
@@ -332,27 +387,69 @@ func worker(jobsystem JobSystem, config ConfigRoot) {
 			continue
 		}
 
-		jobFile := filepath.Join(config.Paths.Results, string(ticket.Id), "job.json")
-
-		f, err := os.Open(jobFile)
-		if err != nil {
-			jobsystem.SetStatus(ticket.Id, StatusError)
-			log.Print(err)
-			continue
-		}
-
 		var job JobRequest
-		dec := json.NewDecoder(bufio.NewReader(f))
-		err = dec.Decode(&job)
-		f.Close()
-		if err != nil {
-			jobsystem.SetStatus(ticket.Id, StatusError)
-			log.Print(err)
-			continue
+		if stored {
+			job, err = stageJob(store, ticket.Id, config)
+			if err != nil {
+				jobsystem.SetStatus(ticket.Id, StatusError)
+				log.Print(err)
+				continue
+			}
+		} else {
+			jobFile := filepath.Join(config.Paths.Results, string(ticket.Id), "job.json")
+
+			f, err := os.Open(jobFile)
+			if err != nil {
+				jobsystem.SetStatus(ticket.Id, StatusError)
+				log.Print(err)
+				continue
+			}
+
+			dec := json.NewDecoder(bufio.NewReader(f))
+			err = dec.Decode(&job)
+			f.Close()
+			if err != nil {
+				jobsystem.SetStatus(ticket.Id, StatusError)
+				log.Print(err)
+				continue
+			}
 		}
 
 		jobsystem.SetStatus(ticket.Id, StatusRunning)
+
+		// The RUNNING status expires unless the worker keeps saying it is
+		// still here, so that a job whose worker dies stops being RUNNING.
+		var beat chan struct{}
+		if stored {
+			beat = make(chan struct{})
+			go store.Heartbeat(ticket.Id, beat)
+		}
+
 		err = RunJob(job, config)
+
+		if beat != nil {
+			close(beat)
+		}
+
+		if stored {
+			if err == nil {
+				// Results go in before the job is marked COMPLETE: a client
+				// that sees COMPLETE fetches immediately, and once the
+				// directory is gone this is the only copy. A store that failed
+				// leaves the directory alone, so the results are not lost from
+				// both places at once.
+				if errStore := storeResults(store, ticket.Id, job, config); errStore != nil {
+					log.Print(errStore)
+					err = &JobExecutionError{errStore}
+				}
+			} else {
+				// A failed job leaves nothing anyone can fetch, and its
+				// directory sits on this worker's own disk where no cleanup
+				// job can reach it later.
+				os.RemoveAll(filepath.Join(filepath.Clean(config.Paths.Results), string(ticket.Id)))
+			}
+		}
+
 		mailTemplate := config.Mail.Templates.Success
 		switch err.(type) {
 		case *JobExecutionError, *JobInvalidError:

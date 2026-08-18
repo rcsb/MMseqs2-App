@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"time"
 
 	"github.com/go-redis/redis"
 )
@@ -123,10 +125,15 @@ type JobSystem interface {
 
 type RedisJobSystem struct {
 	Client *redis.Client
+	// How long a finished job's status, input and results are kept. Zero keeps
+	// them for ever, which is what v7 did when a shared volume held results.
+	Retention time.Duration
+	// How long a RUNNING job survives without a heartbeat from its worker.
+	Lease time.Duration
 }
 
 func MakeRedisJobSystem(config ConfigRedis) *RedisJobSystem {
-	return &RedisJobSystem{redis.NewClient(&redis.Options{
+	return &RedisJobSystem{Client: redis.NewClient(&redis.Options{
 		Network:  config.Network,
 		Addr:     config.Address,
 		Password: config.Password,
@@ -135,16 +142,35 @@ func MakeRedisJobSystem(config ConfigRedis) *RedisJobSystem {
 }
 
 func (j *RedisJobSystem) SetStatus(id Id, status Status) error {
-	_, err := j.Client.Set("mmseqs:status:"+string(id), string(status), 0).Result()
+	// A queued job has no lifetime yet, a running one lives as long as its
+	// worker keeps saying so, and a finished one lives as long as its results
+	// are worth keeping.
+	expiry := time.Duration(0)
+	switch status {
+	case StatusRunning:
+		expiry = j.Lease
+	case StatusComplete, StatusError:
+		expiry = j.Retention
+	}
+
+	_, err := j.Client.Set(keyStatus+string(id), string(status), expiry).Result()
 	if err != nil {
 		return err
+	}
+
+	if expiry > 0 && (status == StatusComplete || status == StatusError) {
+		// The input and the results are only useful for as long as the status
+		// is, so all three expire together and a ticket is never COMPLETE with
+		// nothing behind it.
+		j.Client.Expire(keyJob+string(id), expiry)
+		j.Client.Expire(keyResult+string(id), expiry)
 	}
 
 	return nil
 }
 
 func (j *RedisJobSystem) Status(id Id) (Status, error) {
-	res, err := j.Client.Get("mmseqs:status:" + string(id)).Result()
+	res, err := j.Client.Get(keyStatus + string(id)).Result()
 	if err != nil {
 		if err == redis.Nil {
 			return StatusUnknown, nil
@@ -172,28 +198,16 @@ func (j *RedisJobSystem) NewJob(request JobRequest, jobsbase string, allowResubm
 		return Ticket{id, StatusError}, err
 	}
 
-	workdir := filepath.Join(jobsbase, string(id))
-
 	switch res {
 	case StatusComplete:
-		if allowResubmit {
-			os.RemoveAll(workdir)
-			break
-		} else {
+		if allowResubmit == false {
 			return Ticket{id, res}, nil
 		}
+		j.Forget(id)
 	case StatusPending, StatusRunning:
 		return Ticket{id, res}, nil
 	case StatusError:
-		os.RemoveAll(workdir)
-		break
-	}
-
-	if _, err := os.Stat(workdir); os.IsNotExist(err) {
-		err = os.Mkdir(workdir, 0755)
-		if err != nil {
-			return Ticket{id, StatusError}, err
-		}
+		j.Forget(id)
 	}
 
 	job, ok := request.Job.(Job)
@@ -201,50 +215,31 @@ func (j *RedisJobSystem) NewJob(request JobRequest, jobsbase string, allowResubm
 		return Ticket{id, StatusError}, errors.New("Invalid Job")
 	}
 
-	t := Ticket{id, StatusUnknown}
+	var buf bytes.Buffer
+	if err := json.NewEncoder(&buf).Encode(request); err != nil {
+		return Ticket{id, StatusError}, err
+	}
+
+	// No job directory is created here. This server is not going to run the
+	// job and need not share a disk with the worker that does: everything the
+	// worker needs is in the request. It has to be readable before the ticket
+	// is queued, or a fast worker dequeues a job it cannot stage.
 	err = j.Client.Watch(func(tx *redis.Tx) error {
-		err := request.WriteSupportFiles(workdir)
-		if err != nil {
-			return err
-		}
-
-		file, err := os.Create(filepath.Join(workdir, "job.json"))
-		if err != nil {
-			return err
-		}
-		err = json.NewEncoder(file).Encode(request)
-		if err != nil {
-			file.Close()
-			return err
-		}
-		err = file.Close()
-		if err != nil {
-			return err
-		}
-		_, err = tx.Set("mmseqs:status:"+string(id), string(StatusPending), 0).Result()
-		if err != nil {
-			return err
-		}
-		t.RawStatus = StatusPending
-
-		_, err = tx.ZAdd("mmseqs:pending", redis.Z{Score: job.Rank(), Member: string(id)}).Result()
-		if err != nil {
-			return err
-		}
-
-		return nil
+		_, err := tx.TxPipelined(func(pipe redis.Pipeliner) error {
+			pipe.Set(keyJob+string(id), buf.String(), 0)
+			pipe.Set(keyStatus+string(id), string(StatusPending), 0)
+			pipe.ZAdd("mmseqs:pending", redis.Z{Score: job.Rank(), Member: string(id)})
+			return nil
+		})
+		return err
 	})
 
 	if err != nil {
-		t.RawStatus = StatusError
-		_, errRedis := j.Client.Set("mmseqs:status:"+string(id), string(StatusError), 0).Result()
-		if errRedis != nil {
-			return t, errRedis
-		}
-		return t, err
+		j.SetStatus(id, StatusError)
+		return Ticket{id, StatusError}, err
 	}
 
-	return t, nil
+	return Ticket{id, StatusPending}, nil
 }
 
 func (j *RedisJobSystem) MultiStatus(ids []string) ([]Ticket, error) {
@@ -257,7 +252,7 @@ func (j *RedisJobSystem) MultiStatus(ids []string) ([]Ticket, error) {
 		if !validId(value) {
 			continue
 		}
-		queries = append(queries, "mmseqs:status:"+value)
+		queries = append(queries, keyStatus+value)
 	}
 
 	r, err := j.Client.MGet(queries...).Result()

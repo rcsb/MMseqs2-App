@@ -347,7 +347,15 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 			return
 		}
 
-		request, err := getJobRequestFromFile(filepath.Join(config.Paths.Results, string(ticket.Id), "job.json"))
+		// The request is in redis, which is just as well: the job directory it
+		// used to be read from belongs to a worker and is deleted when the job
+		// finishes.
+		var request JobRequest
+		if store, ok := Results(jobsystem); ok {
+			request, err = store.LoadJobRequest(ticket.Id)
+		} else {
+			request, err = getJobRequestFromFile(filepath.Join(config.Paths.Results, string(ticket.Id), "job.json"))
+		}
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
@@ -407,8 +415,12 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 
 		status, err := jobsystem.Status(ticket.Id)
-		if err != nil || status != StatusComplete {
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if status != StatusComplete {
+			http.Error(w, "Job "+string(ticket.Id)+" is "+string(status), http.StatusBadRequest)
 			return
 		}
 
@@ -445,9 +457,32 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 
 		status, err := jobsystem.Status(ticket.Id)
-		if err != nil || status != StatusComplete {
+		if err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
+		}
+		// Not a nil error dereference any more: a job whose results expired
+		// arrives here as UNKNOWN rather than COMPLETE.
+		if status != StatusComplete {
+			http.Error(w, "Job "+string(ticket.Id)+" is "+string(status), http.StatusBadRequest)
+			return
+		}
+
+		// The job directory this used to read lives on one worker's disk for
+		// the length of the job and nowhere after that, so the rendered
+		// response comes from redis. Falling through to the files covers job
+		// types the store cannot render, and jobs still on this pod's disk.
+		if store, ok := Results(jobsystem); ok {
+			payload, err := store.LoadResult(ticket.Id, int64(id))
+			if err != nil {
+				http.Error(w, err.Error(), http.StatusBadRequest)
+				return
+			}
+			if payload != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.Write(payload)
+				return
+			}
 		}
 
 		results, err := Alignments(ticket.Id, int64(id), config.Paths.Results)

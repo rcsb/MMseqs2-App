@@ -13,12 +13,15 @@ type MsaJob struct {
 	Size     int      `json:"size" valid:"required"`
 	Database []string `json:"database" valid:"required"`
 	Mode     string   `json:"mode" valid:"required"`
-	query    string
+	// Exported so that a JobRequest fully describes its job: the worker that
+	// runs it has never seen the job.fasta a server wrote, it only gets this
+	// struct back out of redis.
+	Query string `json:"query"`
 }
 
 func (r MsaJob) Hash() Id {
 	h := sha256.New224()
-	h.Write([]byte(r.query))
+	h.Write([]byte(r.Query))
 	h.Write([]byte(r.Mode))
 
 	sort.Strings(r.Database)
@@ -36,7 +39,7 @@ func (r MsaJob) Rank() float64 {
 }
 
 func (r MsaJob) WriteFasta(path string) error {
-	err := ioutil.WriteFile(path, []byte(r.query), 0644)
+	err := ioutil.WriteFile(path, []byte(r.Query), 0644)
 	if err != nil {
 		return err
 	}
