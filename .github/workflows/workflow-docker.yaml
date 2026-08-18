@@ -21,4 +21,5 @@ jobs:
       # This fork's master is upstream's, which is ~900 commits past the v7 line we build
       # on, so an image built from it must not be the one tagged "production". Turn this
       # back on once a branch of ours is the mainline (and set mainline_branch to it).
-      do_production_build: "false"
+      do_production_build: "true"
+      mainline_branch: "master-rcsb"
