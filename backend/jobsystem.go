@@ -130,6 +130,10 @@ type RedisJobSystem struct {
 	Retention time.Duration
 	// How long a RUNNING job survives without a heartbeat from its worker.
 	Lease time.Duration
+	// How long a queued job stays known. Nothing outside redis records when a
+	// job was submitted, so this expiry is what tells a queue prune that an
+	// entry has been waiting longer than anyone is waiting for it.
+	Queue time.Duration
 }
 
 func MakeRedisJobSystem(config ConfigRedis) *RedisJobSystem {
@@ -147,6 +151,8 @@ func (j *RedisJobSystem) SetStatus(id Id, status Status) error {
 	// are worth keeping.
 	expiry := time.Duration(0)
 	switch status {
+	case StatusPending:
+		expiry = j.Queue
 	case StatusRunning:
 		expiry = j.Lease
 	case StatusComplete, StatusError:
@@ -227,7 +233,7 @@ func (j *RedisJobSystem) NewJob(request JobRequest, jobsbase string, allowResubm
 	err = j.Client.Watch(func(tx *redis.Tx) error {
 		_, err := tx.TxPipelined(func(pipe redis.Pipeliner) error {
 			pipe.Set(keyJob+string(id), buf.String(), 0)
-			pipe.Set(keyStatus+string(id), string(StatusPending), 0)
+			pipe.Set(keyStatus+string(id), string(StatusPending), j.Queue)
 			pipe.ZAdd("mmseqs:pending", redis.Z{Score: job.Rank(), Member: string(id)})
 			return nil
 		})

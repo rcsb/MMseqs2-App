@@ -58,6 +58,7 @@ func makeJobSystem(config ConfigRoot) *RedisJobSystem {
 	jobsystem := MakeRedisJobSystem(config.Redis)
 	jobsystem.Retention = config.Results.Retention()
 	jobsystem.Lease = config.Results.LeaseDuration()
+	jobsystem.Queue = config.Results.QueueTTL()
 	return jobsystem
 }
 

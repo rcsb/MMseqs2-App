@@ -48,8 +48,10 @@ resubmittable, instead of staying `RUNNING` for as long as redis does. This also
 fixes that failure in the shared-volume setup, where such tickets were stuck for
 good.
 
-Nothing expires while a job is queued: an abandoned queue entry is the queue
-prune's business.
+`results.queue` (minutes) is how long a queued job's ticket stays known. It is
+also the clock a queue prune runs on: nothing outside redis records when a job
+was submitted, so an entry still queued after its status expired is by
+definition one nobody is waiting for.
 
 ## What this build does not serve
 
@@ -107,7 +109,9 @@ resubmitting the query runs it again.
     // minutes a finished job stays fetchable
     "ttl"   : 15,
     // seconds a running job survives without a heartbeat from its worker
-    "lease" : 60
+    "lease" : 60,
+    // minutes a queued job's ticket stays known
+    "queue" : 5
 }
 ```
 

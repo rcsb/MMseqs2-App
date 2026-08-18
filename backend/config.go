@@ -46,7 +46,9 @@ var defaultFileContent = []byte(`{
         // minutes a finished job stays fetchable
         "ttl"   : 15,
         // seconds a running job survives without a heartbeat from its worker
-        "lease" : 60
+        "lease" : 60,
+        // minutes a queued job's ticket stays known
+        "queue" : 5
     },
     // connection details for redis database, not used in -local mode
     "redis" : {
@@ -178,11 +180,17 @@ type ConfigResults struct {
 	// worker that dies mid-job stops being RUNNING after this, and the
 	// ticket becomes resubmittable instead of stuck for ever.
 	Lease int `json:"lease" valid:"optional"`
+	// Minutes a queued job's ticket stays known. A job still waiting to start
+	// after this was given up on long ago: clients stop polling within a
+	// minute. It is also the clock the queue prune runs on, since a queue
+	// entry whose status has expired is one nobody is waiting for.
+	Queue int `json:"queue" valid:"optional"`
 }
 
 const (
 	DefaultResultTTL   = 15 * time.Minute
 	DefaultResultLease = 60 * time.Second
+	DefaultResultQueue = 5 * time.Minute
 )
 
 func (c ConfigResults) Retention() time.Duration {
@@ -190,6 +198,13 @@ func (c ConfigResults) Retention() time.Duration {
 		return DefaultResultTTL
 	}
 	return time.Duration(c.TTL) * time.Minute
+}
+
+func (c ConfigResults) QueueTTL() time.Duration {
+	if c.Queue <= 0 {
+		return DefaultResultQueue
+	}
+	return time.Duration(c.Queue) * time.Minute
 }
 
 func (c ConfigResults) LeaseDuration() time.Duration {
