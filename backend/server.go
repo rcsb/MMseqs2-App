@@ -31,7 +31,20 @@ func server(jobsystem JobSystem, config ConfigRoot) {
 		}
 
 		for _, db := range databases {
-			if db.Status == StatusRunning {
+			// A database that is already built is left alone. Something else
+			// built it before this process started -- in the deployment, the
+			// database-builder init container, which does not exit until every
+			// non-empty database is COMPLETE -- so an index job here only makes
+			// a worker re-verify an index and page it back in. Measured at about
+			// a minute per database, during which that worker runs no searches
+			// and the database is marked RUNNING, so it also drops out of
+			// /api/databases and takes the pod out of the service with it.
+			//
+			// Note what this gives up: nothing re-checks at startup whether an
+			// index is still compatible with the mmseqs binary. That is a fair
+			// trade where the databases are rebuilt from scratch on every pod
+			// start, and would not be somewhere they are kept across upgrades.
+			if db.Status == StatusRunning || db.Status == StatusComplete {
 				continue
 			}
 
