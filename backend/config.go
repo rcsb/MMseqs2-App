@@ -16,6 +16,10 @@ import (
 var defaultFileContent = []byte(`{
     // should mmseqs und webserver output be printed
     "verbose": true,
+    // drop mmseqs' own output (~200 lines per search) while keeping the app's:
+    // the per-job completion line and the server access log survive, which is
+    // what makes the container log useful for more than a few seconds under load
+    "quietmmseqs": false,
     "server" : {
         "address"    : "127.0.0.1:8081",
         // prefix for all API endpoints
@@ -222,6 +226,22 @@ type ConfigRoot struct {
 	Mail    ConfigMail    `json:"mail" valid:"optional"`
 	Results ConfigResults `json:"results" valid:"optional"`
 	Verbose bool          `json:"verbose"`
+	// QuietMmseqs drops the search tool's own output while leaving the app's
+	// logging alone. Phrased as an opt-in negative so that a config that does
+	// not mention it behaves exactly as it did before.
+	QuietMmseqs bool `json:"quietmmseqs"`
+}
+
+// ShowMmseqsOutput reports whether mmseqs' own stdout and stderr are passed
+// through to the log.
+//
+// It is about 200 lines per search, which is the difference between a container
+// log that holds hours of history and one that holds seconds. Losing it takes
+// the app's own logging with it: the completion line each job writes, and the
+// server's access log, are the two things anyone reconstructs an incident from,
+// and they are the same handful of lines per request that mmseqs buries.
+func (c ConfigRoot) ShowMmseqsOutput() bool {
+	return c.Verbose && !c.QuietMmseqs
 }
 
 func ReadConfigFromFile(name string) (ConfigRoot, error) {

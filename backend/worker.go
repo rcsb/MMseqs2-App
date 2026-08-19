@@ -63,7 +63,16 @@ func execCommand(verbose bool, parameters ...string) (*exec.Cmd, chan error, err
 	return cmd, done, err
 }
 
+// logJobFinished is the one line a completed job leaves behind. It says which
+// job, of what kind, and how long the mmseqs work took, because that line is
+// what anyone counts to measure throughput and what they read to see whether a
+// slow period was slow searches or a deep queue.
+func logJobFinished(request JobRequest, started time.Time) {
+	log.Printf("job %s %s finished in %s", request.Type, request.Id, time.Since(started).Round(time.Millisecond))
+}
+
 func RunJob(request JobRequest, config ConfigRoot) (err error) {
+	started := time.Now()
 	switch job := request.Job.(type) {
 	case SearchJob:
 		resultBase := filepath.Join(config.Paths.Results, string(request.Id))
@@ -95,7 +104,7 @@ func RunJob(request JobRequest, config ConfigRoot) (err error) {
 				parameters = append(parameters, "--greedy-best-hits")
 			}
 
-			cmd, done, err := execCommand(config.Verbose, parameters...)
+			cmd, done, err := execCommand(config.ShowMmseqsOutput(), parameters...)
 			if err != nil {
 				return &JobExecutionError{err}
 			}
@@ -129,7 +138,7 @@ func RunJob(request JobRequest, config ConfigRoot) (err error) {
 		}
 
 		if config.Verbose {
-			log.Print("Process finished gracefully without error")
+			logJobFinished(request, started)
 		}
 		return nil
 	case MsaJob:
@@ -204,7 +213,7 @@ rm -rf "${BASE}/tmp"
 			params1.Display.Search,
 		}
 
-		cmd, done, err := execCommand(config.Verbose, parameters...)
+		cmd, done, err := execCommand(config.ShowMmseqsOutput(), parameters...)
 		if err != nil {
 			return &JobExecutionError{err}
 		}
@@ -276,7 +285,7 @@ rm -rf "${BASE}/tmp"
 		}
 
 		if config.Verbose {
-			log.Print("Process finished gracefully without error")
+			logJobFinished(request, started)
 		}
 		return nil
 	case IndexJob:
@@ -297,7 +306,7 @@ rm -rf "${BASE}/tmp"
 			return &JobExecutionError{err}
 		}
 		if config.Verbose {
-			log.Println("Process finished gracefully without error")
+			logJobFinished(request, started)
 		}
 		params.Status = StatusComplete
 		err = SaveParams(file+".params", params)

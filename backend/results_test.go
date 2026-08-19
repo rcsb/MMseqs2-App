@@ -249,3 +249,26 @@ func TestResultConfigDefaults(t *testing.T) {
 		t.Fatalf("retention=%v lease=%v", set.Retention(), set.LeaseDuration())
 	}
 }
+
+// The point of splitting the flag: mmseqs' own output is what floods the log,
+// and it has to be droppable without losing the app's own logging with it.
+func TestQuietMmseqsLeavesAppLoggingAlone(t *testing.T) {
+	cases := []struct {
+		verbose bool
+		quiet   bool
+		want    bool
+		why     string
+	}{
+		{true, false, true, "unset quietmmseqs behaves as before: verbose means everything"},
+		{true, true, false, "what production runs: mmseqs silent, app logging kept"},
+		{false, false, false, "verbose off silences mmseqs too"},
+		{false, true, false, "quiet cannot turn output back on"},
+	}
+
+	for _, c := range cases {
+		config := ConfigRoot{Verbose: c.verbose, QuietMmseqs: c.quiet}
+		if got := config.ShowMmseqsOutput(); got != c.want {
+			t.Errorf("verbose=%v quiet=%v -> %v, want %v (%s)", c.verbose, c.quiet, got, c.want, c.why)
+		}
+	}
+}
